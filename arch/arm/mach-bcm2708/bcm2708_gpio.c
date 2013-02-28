@@ -160,12 +160,13 @@ static void bcm2708_gpio_set(struct gpio_chip *gc, unsigned offset, int value)
 //printk(KERN_ERR DRIVER_NAME ": bcm2708_gpio_set %p (%d=%d)\n", gc, offset, value);
 	if (offset >= BCM_NR_GPIOS)
 		return;
+	/* JWJ -- get time of change before output */
+	t = readl(TVAL);
 	if (value)
 		writel(1 << gpio_field_offset, gpio->base + GPIOSET(gpio_bank));
 	else
 		writel(1 << gpio_field_offset, gpio->base + GPIOCLR(gpio_bank));
-	/* JWJ -- record time of change */
-	t = readl(TVAL);
+	/* JWJ -- record time of change; may run after an interrupt caused by change */
 	gpt = gptimes[offset];
 	gpt->time[1] = gpt->time[0];
 	gpt->time[0] = t;
@@ -418,7 +419,6 @@ static const struct sysfs_ops period_sysfs_ops = {
 
 static ssize_t period_show(char *buf) {
 	int p;
-	printk(KERN_INFO "period_show called\n");
 	p = readl(TCTRL);
 	if (!TENB(p)) {
 		return sprintf(buf, "0\n");
@@ -450,7 +450,6 @@ static struct attribute *period_default_attrs[] = {
 static ssize_t gpio_time_show(struct gpio_time *gpt, struct gpio_attribute *attr,
 		      char *buf)
 {
-	printk(KERN_INFO "gpio_time_show called\n");
 	return sprintf(buf, "%u %u\n", gpt->time[0], gpt->time[1]);
 }
 
@@ -545,8 +544,6 @@ static int bcm2708_gpio_probe(struct platform_device *dev)
 	}
 	
 	/* JWJ -- GPIO timing sysfs interface */
-	
-	printk(KERN_INFO "GPIO timing init\n");
 	
 	gpioks = kset_create_and_add("gpio_time", NULL, kernel_kobj);
 	// seems to cause kernel warning:
