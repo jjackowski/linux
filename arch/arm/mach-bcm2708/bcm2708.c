@@ -423,7 +423,12 @@ static struct resource bcm2708_gpio_resources[] = {
 	       .start = GPIO_BASE,
 	       .end = GPIO_BASE + SZ_4K - 1,
 	       .flags = IORESOURCE_MEM,
-	       },
+	   },
+	   { /* for support of recording time of GPIO state changes */
+	   	   .start = ARMCTRL_TIMER0_1_BASE,
+	       .end = ARMCTRL_TIMER0_1_BASE + SZ_512 - 1,
+	       .flags = IORESOURCE_MEM,
+	   },
 };
 
 static u64 gpio_dmamask = DMA_BIT_MASK(DMA_MASK_BITS_COMMON);

@@ -1,0 +1,3 @@
+#!/bin/sh
+# run this instead of make for configuring and building with a cross-compiler
+exec make ARCH="arm" CROSS_COMPILE="armv6j-hardfloat-linux-gnueabi-" INSTALL_MOD_PATH="modules" "$@"
