@@ -31,6 +31,7 @@
 #include <linux/slab.h>
 #include <linux/i2c.h>
 #include <linux/interrupt.h>
+#include <linux/delay.h>
 #include <linux/sched.h>
 #include <linux/wait.h>
 
@@ -74,9 +75,6 @@ static unsigned int baudrate = CONFIG_I2C_BCM2708_BAUDRATE;
 module_param(baudrate, uint, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 MODULE_PARM_DESC(baudrate, "The I2C baudrate");
 
-static bool combined = false;
-module_param(combined, bool, 0644);
-MODULE_PARM_DESC(combined, "Use combined transactions");
 
 struct bcm2708_i2c {
 	struct i2c_adapter adapter;
@@ -153,7 +151,7 @@ static inline void bcm2708_bsc_fifo_fill(struct bcm2708_i2c *bi)
 static inline void bcm2708_bsc_setup(struct bcm2708_i2c *bi)
 {
 	unsigned long bus_hz;
-	u32 cdiv, s;
+	u32 cdiv;
 	u32 c = BSC_C_I2CEN | BSC_C_INTD | BSC_C_ST | BSC_C_CLEAR_1;
 
 	bus_hz = clk_get_rate(bi->clk);
@@ -169,32 +167,6 @@ static inline void bcm2708_bsc_setup(struct bcm2708_i2c *bi)
 	bcm2708_wr(bi, BSC_DIV, cdiv);
 	bcm2708_wr(bi, BSC_A, bi->msg->addr);
 	bcm2708_wr(bi, BSC_DLEN, bi->msg->len);
-	if (combined)
-	{
-		/* Do the next two messages meet combined transaction criteria?
-		   - Current message is a write, next message is a read
-		   - Both messages to same slave address
-		   - Write message can fit inside FIFO (16 bytes or less) */
-		if ( (bi->nmsgs > 1) &&
-		    !(bi->msg[0].flags & I2C_M_RD) && (bi->msg[1].flags & I2C_M_RD) &&
-		     (bi->msg[0].addr == bi->msg[1].addr) && (bi->msg[0].len <= 16)) {
-			/* Fill FIFO with entire write message (16 byte FIFO) */
-			while (bi->pos < bi->msg->len)
-				bcm2708_wr(bi, BSC_FIFO, bi->msg->buf[bi->pos++]);
-			/* Start write transfer (no interrupts, don't clear FIFO) */
-			bcm2708_wr(bi, BSC_C, BSC_C_I2CEN | BSC_C_ST);
-			/* poll for transfer start bit (should only take 1-20 polls) */
-			do {
-				s = bcm2708_rd(bi, BSC_S);
-			} while (!(s & (BSC_S_TA | BSC_S_ERR | BSC_S_CLKT | BSC_S_DONE)));
-			/* Send next read message before the write transfer finishes. */
-			bi->nmsgs--;
-			bi->msg++;
-			bi->pos = 0;
-			bcm2708_wr(bi, BSC_DLEN, bi->msg->len);
-			c = BSC_C_I2CEN | BSC_C_INTD | BSC_C_INTR | BSC_C_ST | BSC_C_READ;
-		}
-	}
 	bcm2708_wr(bi, BSC_C, c);
 }
 
@@ -267,7 +239,59 @@ static int bcm2708_i2c_master_xfer(struct i2c_adapter *adap,
 
 	spin_unlock_irqrestore(&bi->lock, flags);
 
-	bcm2708_bsc_setup(bi);
+	// special case: send a byte followed by receive; need to poll (arrrg!)
+	if ((num == 2) && (msgs[0].len == 1) && (msgs[1].len > 0) && !(msgs[0].flags & I2C_M_RD) && (msgs[1].flags & I2C_M_RD)) {
+		// steps:
+		//  - start the first transfer
+		//  - setup data for the interrupt handler in advance
+		//  - poll for it to begin (this is why the special case isn't in the interrupt)
+		//  - setup next transfer
+		//  - handoff to interrupt handler
+		
+		unsigned long bus_hz;
+		u32 cdiv, stat;
+		bus_hz = clk_get_rate(bi->clk);
+		cdiv = bus_hz / baudrate;
+		
+		// start transfer
+		// like bcm2708_bsc_setup(), but interrupt flags are clear
+		bcm2708_wr(bi, BSC_C, BSC_C_CLEAR_1);
+		bcm2708_bsc_reset(bi);     // needed?
+		bcm2708_wr(bi, BSC_DIV, cdiv);
+		bcm2708_wr(bi, BSC_A, msgs[0].addr);
+		// steps from the BCM2835 manual
+		bcm2708_wr(bi, BSC_DLEN, 1);
+		bcm2708_wr(bi, BSC_FIFO, msgs[0].buf[0]);  // the byte to send
+		//bcm2708_wr(bi, BSC_C, BSC_C_I2CEN);
+		bcm2708_wr(bi, BSC_C, BSC_C_I2CEN | BSC_C_ST);
+
+		// setup data for the interrupt handler
+		bi->msg++;
+		bi->nmsgs--;
+		
+		// poll for start of transfer
+		do {
+			stat = bcm2708_rd(bi, BSC_S);
+		} while (!(stat & (BSC_S_CLKT | BSC_S_ERR | BSC_S_TA | BSC_S_DONE)));
+		// check for trouble
+		if (stat & (BSC_S_CLKT | BSC_S_ERR)) {
+			dev_err(&adap->dev, "1st message failure\n");
+			bcm2708_bsc_reset(bi);
+			bcm2708_wr(bi, BSC_C, BSC_C_I2CEN | BSC_C_CLEAR_1);
+			return -EIO;
+		}
+
+		// setup next transfer before the first is complete
+		bcm2708_wr(bi, BSC_DLEN, msgs[1].len);
+		bcm2708_wr(bi, BSC_C,
+			BSC_C_I2CEN | BSC_C_ST | BSC_C_READ | BSC_C_INTD | BSC_C_INTR);
+
+		// interrupt flags now set -- let the interrupt handler deal with it
+	}
+	else {
+		// let the interrupt handler do all the work
+		bcm2708_bsc_setup(bi);
+	}
 
 	ret = wait_for_completion_timeout(&bi->done,
 			msecs_to_jiffies(I2C_TIMEOUT_MS));
